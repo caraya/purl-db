@@ -1,0 +1,38 @@
+{
+  "name": "purl-resolver",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc && tsc -p tsconfig.web.json && vite build",
+    "start": "node dist/server.js",
+    "test": "npm run typecheck:test && node --experimental-strip-types --test",
+    "typecheck:test": "tsc -p test/tsconfig.json",
+    "db:push": "drizzle-kit push"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "dependencies": {
+    "connect-redis": "^9.0.0",
+    "drizzle-orm": "^0.45.4",
+    "express": "^4.21.2",
+    "express-session": "^1.18.2",
+    "pg": "^8.16.3",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "redis": "^5.8.2"
+  },
+  "devDependencies": {
+    "@types/express-session": "^1.18.2",
+    "@types/express": "^4.17.25",
+    "@types/node": "^22.19.0",
+    "@types/pg": "^8.15.5",
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^5.0.4",
+    "drizzle-kit": "^0.31.5",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.5"
+  }
+}
