@@ -1,157 +1,197 @@
-# Building a production PURL resolver
+# PURL Resolver
 
-When working with web content, one of the hardest things to deal with is link rot, when links on your web content die, are moved, or otherwise become unavailable.
+A self-hosted Persistent URL resolver with immutable PURL paths, a PostgreSQL mapping store, Redis caching, GitHub OAuth administration, and a React dashboard. See [architecture.md](architecture.md) for design background and implementation details.
 
-This guide outlines how to build, deploy, and manage a high-performance Persistent Uniform Resource Locator (PURL) resolver using Node.js, Express, PostgreSQL, Redis, and Drizzle ORM.
+## Requirements
 
-## What is a PURL and why choose it?
+- Node.js 22.12 or later
+- Docker with Docker Compose for the local Compose workflow
+- A GitHub OAuth app
 
-A Persistent Uniform Resource Locator (PURL) is a standard web address that acts as a permanent routing alias for a digital object. Instead of pointing directly to a server where a file lives, a PURL points to an intermediate resolution service. This service looks up the current physical location of the resource and redirects the user. This provides a crucial layer of indirection to permanently combat link rot.
+## Configure
 
-While there are many types of persistent identifiers, PURLs are often the best choice for independent organizations due to their simplicity, web-native design, and lack of dependency on central authorities. Here is how they compare to alternatives:
+1. Copy the example environment file:
 
-* **DOIs (Digital Object Identifiers):** DOIs are highly structured and heavily governed. Registering them generally requires paying membership and minting fees to a central registration agency (like Crossref or DataCite).
+   ```sh
+   cp .env.example .env
+   ```
 
-  * *The PURL Advantage:* PURLs are completely free to mint and fully under your sovereign control. There is no bureaucratic overhead, central bottleneck, or recurring tax per link.
+2. Generate secrets:
 
-* **URNs (Uniform Resource Names):** A URN is purely a naming scheme (e.g., `urn:isbn:0451450523`). Web browsers do not natively know what to do with a URN; they require a secondary, often complex resolution infrastructure (like a browser plugin) to actually fetch a file.
+   ```sh
+   openssl rand -hex 16
+   openssl rand -hex 32
+   ```
 
-  * *The PURL Advantage:* PURLs are just standard HTTP URLs. They work natively in every web browser, automated script, and HTTP client on Earth right out of the box.
+   Use the first value as `POSTGRES_PASSWORD` and the second as `SESSION_SECRET` in `.env`. Set the same PostgreSQL password in `DATABASE_URL`. The session secret must be at least 32 bytes; the 32-byte random value is encoded as 64 hexadecimal characters.
 
-* **ARKs (Archival Resource Keys):** ARKs are complex identifiers designed for libraries. They heavily utilize URL inflections (e.g., appending `?` or `??` to a URL to fetch metadata instead of the file), which violates modern web practices and interferes with standard web tracking, analytics, and query parameters.
+3. Register a GitHub OAuth app under your personal account or an organization where you have permission to create apps. In **Settings -> Developer settings -> OAuth Apps -> New OAuth App**, enter:
 
-  * *The PURL Advantage:* PURLs adhere to the "dumb pipe" philosophy. By relying strictly on standard HTTP redirects, they do not hijack standard web mechanics. Internal metadata management is handled securely on the backend, while the public strictly experiences a seamless, standard web redirect.
+   | GitHub field | Value |
+   | --- | --- |
+   | Application name | `PURL Resolver` (or another public-facing name) |
+   | Homepage URL | `https://purl.example.com/admin` |
+   | Application description | Optional |
+   | Authorization callback URL | `https://purl.example.com/api/admin/auth/github/callback` |
 
-### Persistent URLs vs. URL shorteners (like bit.ly)
+   The homepage is the public dashboard URL. The callback is the backend route that completes sign-in; these are different URLs. For local Docker Compose, use homepage URL `http://localhost:6677/admin` and callback URL `http://localhost:6677/api/admin/auth/github/callback`. If you also want to sign in locally, use **Add callback URL** to add that localhost callback. GitHub allows up to 10 callback URLs. Alternatively, create a separate OAuth app for local development.
 
-It is important to distinguish the system we are building from commercial URL shorteners (like bit.ly) and marketing "pURLs" (Personalized URLs used to track individual user engagement).
+   Register the app, copy its **Client ID**, then choose **Generate a new client secret** and copy the secret into your secret manager or local `.env`. GitHub only shows the generated secret when it is created. Leave **Enable Device Flow** off; this app uses the browser authorization-code flow and requests only the `read:user` scope to check the signed-in GitHub username. It does not need repository access or a GitHub token after sign-in.
 
-While a Persistent URL and a URL shortener operate using the exact same technical mechanism under the hood—an HTTP 302 redirect—their core philosophies and use cases are entirely opposite:
+4. Update these `.env` values:
 
-* **Primary Goal:** URL shorteners prioritize brevity and click-tracking for temporary marketing campaigns. PURLs prioritize permanence and stability to guarantee a citation will work decades from now.
+   ```dotenv
+   GITHUB_CLIENT_ID=your-oauth-client-id
+   GITHUB_CLIENT_SECRET=your-oauth-client-secret
+   GITHUB_USERNAME=your-github-username
+   APP_ORIGIN=http://localhost:6677
+   TRUST_PROXY=false
+   ```
 
-* **Target Mutability:** A short link's destination is generally static; if the target page dies, the short link dies with it. A PURL's core purpose is to be dynamically updated when a target file moves, ensuring the original published link never breaks.
+   `GITHUB_USERNAME` is the only GitHub account allowed to administer PURLs and must match the account's GitHub login. `APP_ORIGIN` is the browser-facing origin, without a path or trailing route. The callback URL registered with GitHub must exactly equal `${APP_ORIGIN}/api/admin/auth/github/callback`; do not enter the literal `${APP_ORIGIN}` expression in GitHub settings. For local Compose use `APP_ORIGIN=http://localhost:6677`; for production use the public HTTPS origin, such as `https://purl.example.com`. Set `TRUST_PROXY=true` only when the app is behind a trusted reverse proxy that forwards the original protocol.
 
-* **Sovereignty:** URL shorteners are SaaS dependencies. If the provider goes bankrupt or raises prices, your links break. A self-hosted PURL resolver gives you absolute ownership over your organization's routing infrastructure.
+The remaining values in `.env.example` work with the supplied Compose services. If you change the PostgreSQL user, password, or database name, update both the `POSTGRES_*` settings and `DATABASE_URL` to match. URL-encode any special characters in credentials used in `DATABASE_URL`.
 
-### Naming philosophy: Semantic vs. Opaque identifiers
+## Run
 
-When minting your PURLs, you must choose a naming convention. There are two primary schools of thought:
+Start the resolver, PostgreSQL, and Redis:
 
-#### **1. Semantic (Human-Readable) Identifiers**
-
-* *Example:* `/research/physics/2026/data`
-* *Pros:* Provides essential context in environments where the URL must be explicitly written out. If a user is reading a printed paper, or reading a formal bibliography (like Chicago or APA style) where the raw URL is fully displayed, they know exactly what they are navigating to.
-* *Cons & Operator Governance:* Semantic identifiers are vulnerable to administrative operator error. If a department is renamed from "Physics" to "Physical Sciences", the underlying file location will eventually change (link rot). When an administrator logs in to update the PURL's destination to fix the link rot, the human-readable path (`/physics`) tempts them to also update the PURL path to match the new department name. Doing so instantly breaks all existing printed citations.
-
-  *The Solution:* This is strictly an operator issue, solved by software governance. **The PURL path must be mathematically immutable.** Once created, your software must never allow the path string to be edited. If a department demands a new semantic URL to reflect their new name, the administrator simply creates a *second, brand-new* PURL for them, while leaving the original PURL permanently active and pointing to the same destination.
-
-#### **2. Opaque (Random) Identifiers**
-
-* *Example:* `/item/a7x9j2m4PqW1`
-
-* *Pros:* The ultimate defense against human meddling. Because a random string carries no meaning, it can never become politically sensitive or factually incorrect. Administrators are never tempted to "fix" the text of an opaque URL when fixing link rot.
-
-* *Cons:* In formal printed citations (e.g., Chicago style) where the reader is forced to look at the raw URL without a hyperlink, the string gives absolutely no contextual clues about the destination, and can appear difficult to type or visually unappealing.
-
-*Note on Technical Permanence:* Regardless of the naming convention you choose, a PURL fundamentally prevents technical link rot. Even if the target destination file is completely deleted from the live internet, the PURL administrator can simply update the database to redirect the PURL to a snapshot on the Internet Archive, ensuring the original citation lives on forever.
-
-## Core architecture
-
-Unlike complex decentralized identifier systems, a PURL relies on basic, robust web mechanics. The architecture consists of three simple steps:
-
-1. **The Request:** A user clicks or requests a PURL, such as `https://purl.yourdomain.org/research/alpha`.
-
-2. **The Lookup:** The Express server intercepts the request and queries the PostgreSQL database (or the Redis cache) to find the current destination.
-
-3. **The Redirect:** The server issues an HTTP 302 Found response, directing the browser to the actual, current location of the file (e.g., an AWS S3 bucket).
-
-## Run the resolver
-
-The resolver and admin dashboard are implemented in `src/` and `web/`. The app requires Node.js 22.12 or later, Docker Compose, and a GitHub OAuth app.
-
-1. Copy `.env.example` to `.env`. Set `POSTGRES_PASSWORD` and use the same password in `DATABASE_URL`.
-1. Create a GitHub OAuth app with callback URL `http://localhost:3000/api/admin/auth/github/callback`. Set its client ID, secret, and the allowed GitHub username in `.env`.
-1. Replace `SESSION_SECRET` with the output of `openssl rand -hex 32` and set `APP_ORIGIN=http://localhost:3000`.
-1. Run `docker-compose up --build`, then open `http://localhost:3000/admin` and sign in with the allowed GitHub account.
-
-Compose applies the Drizzle schema before starting the app. PURLs can then be created and maintained in the admin dashboard. Run `npm test` for API and resolver tests and `npm run build` to compile the server and dashboard.
-
-## Database schema
-
-We use PostgreSQL for robust persistence and Drizzle ORM for type-safe database interactions. We include a required `title` and optional `description` field to help administrators manage links internally.
-
-```ts
-// schema.ts
-import { pgTable, serial, text, boolean, timestamp } from 'drizzle-orm/pg-core';
-
-export const purlMappings = pgTable('purl_mappings', {
-  id: serial('id').primaryKey(),
-  path: text('path').unique().notNull(),
-  targetUrl: text('target_url').notNull(),
-  title: text('title').notNull(),
-  description: text('description'),
-  isActive: boolean('is_active').default(true).notNull(),
-  createdAt: timestamp('created_at').defaultNow().notNull(),
-  updatedAt: timestamp('updated_at').defaultNow().notNull(),
-});
-
+```sh
+docker-compose up --build
 ```
 
-## Resolution server
+Compose publishes host port `HOST_PORT` (default `6677`) to the app's container port `PORT` (default `3000`), waits for PostgreSQL and Redis health checks, applies the Drizzle schema, and starts the app. Open [http://localhost:6677/admin](http://localhost:6677/admin) and sign in with the configured GitHub account. The dashboard lives at `/admin`; `/` is handled by the PURL resolver and returns `PURL not found` unless you have registered a root PURL. `APP_ORIGIN` is the origin only (`http://localhost:6677`), not the dashboard URL. `vite.config.ts` sets the port for the Vite development server only; it does not control the production container's port. Do not run Vite and Compose on host port 6677 at the same time.
 
-The executable server is [`src/server.ts`](src/server.ts). It mounts the resolver, GitHub OAuth routes, the session-protected admin API, and the compiled React dashboard. Resolver matching and target construction are in [`src/resolution.ts`](src/resolution.ts); the HTTP and Redis behavior are in [`src/resolver-app.ts`](src/resolver-app.ts).
+Create PURLs in the dashboard. Their paths are permanent and cannot be edited; to establish a new name, create another PURL. Updating a destination or deactivating a PURL does not change its path.
 
-### Architecture note: Fail-fast validation
+A PURL such as `http://localhost:6677/research/2026/report.pdf` redirects to the destination registered for `/research/2026`, with the remaining path appended.
 
-`validateEnv()` runs before any listener starts. It requires the PostgreSQL and Redis URLs, GitHub OAuth credentials, an allowlisted username, and a session secret of at least 32 bytes. Missing or invalid settings stop startup.
+Stop the services with:
 
-## Usage examples
-
-If you register `/research/2026` in the database to point to `https://university.edu/storage/dept/2026/`, the resolver automatically handles nested files.
-
-* **User requests:** `https://purl.yourdomain.org/research/2026/report.pdf`
-
-* **Resolver calculates:** Match found for `/research/2026`. Remainder is `/report.pdf`.
-
-* **User is redirected to:** `https://university.edu/storage/dept/2026/report.pdf`
-
-If the university later moves its storage to AWS S3, you simply update the database target to `https://s3.amazonaws.com/uni-archive/2026/`. The original PURL citations in published papers remain perfectly valid.
-
-## Admin API and front-end management
-
-The app includes a GitHub OAuth-protected API and React dashboard. Only the configured GitHub username can manage mappings; client credentials stay on the server and the browser receives an HTTP-only session cookie.
-
-### GitHub OAuth setup
-
-1. Go to GitHub Developer Settings -> OAuth Apps -> "New OAuth App".
-
-1. Set the authorization callback URL to `${APP_ORIGIN}/api/admin/auth/github/callback`. For local Compose, use `http://localhost:3000/api/admin/auth/github/callback`.
-
-1. Set these values in `.env`; generate `SESSION_SECRET` with `openssl rand -hex 32`:
-
-```bash
-DATABASE_URL="postgresql://purls:your-password@db:5432/purls"
-REDIS_URL="redis://cache:6379"
-GITHUB_CLIENT_ID="your_client_id"
-GITHUB_CLIENT_SECRET="your_client_secret"
-GITHUB_USERNAME="your_github_username"
-SESSION_SECRET="your-64-character-hex-secret"
-APP_ORIGIN="https://purl.yourdomain.org"
-TRUST_PROXY="true"
-
+```sh
+docker-compose down
 ```
 
-### Admin API routes
+This preserves the named PostgreSQL volume. `docker-compose down -v` also deletes that volume and its data.
 
-[`src/admin-router.ts`](src/admin-router.ts) requires a verified session, validates HTTP(S) targets and PURL paths, and rejects `path` in update payloads. Successful mutations advance the Redis cache generation so nested redirects cannot continue using stale destinations.
+## Development
 
-The API provides `GET /api/admin/purls`, `POST /api/admin/purls`, and `PUT /api/admin/purls/:id`. The OAuth routes in [`src/auth-router.ts`](src/auth-router.ts) validate one-time state, exchange the code with GitHub, check the configured username, rotate the session ID, and support sign-out.
+Install dependencies and run the checks:
 
-### Dashboard component
+```sh
+npm install
+npm test
+npm run build
+```
 
-The React interface in [`web/PurlManager.tsx`](web/PurlManager.tsx) supports creating and searching PURLs, editing destinations and metadata, toggling activity, and signing out. Existing PURL paths are displayed read-only.
+`npm test` type-checks the test files and runs the resolver, admin API, and OAuth behavior tests. `npm run build` compiles the server and creates the production dashboard bundle.
 
-## Orchestrating with Docker Compose
+To run outside Docker, provide reachable PostgreSQL and Redis instances and set the same required variables from `.env` in your shell. Use host-reachable service URLs (for example, `localhost` rather than Compose service names), then run:
 
-The project [`Dockerfile`](Dockerfile) builds both the TypeScript service and React dashboard. [`docker-compose.yml`](docker-compose.yml) starts the app with PostgreSQL and Redis, waits for healthy dependencies, applies the Drizzle schema, and then starts the server. Copy `.env.example` to `.env` and configure the GitHub OAuth values before launching.
+```sh
+npm run db:push
+npm start
+```
+
+The server listens on `PORT` (default `3000`).
+
+## Google Cloud deployment
+
+Docker is optional. For a static React frontend and a dynamic resolver, deploy the two parts separately. The apex domain can remain on Netlify; use a dedicated subdomain such as `purl.example.com` for the PURL app.
+
+### Static frontend and dynamic backend
+
+Use Firebase Hosting for the built React files in `dist/public`, and route dynamic requests to the resolver service:
+
+- `/admin` serves the static React dashboard.
+- `/api/**` routes OAuth and admin API calls to the backend.
+- Other paths route to the backend for PURL resolution and HTTP redirects.
+
+This keeps frontend assets on Firebase's CDN while leaving database lookups in the backend. Keeping both behind the same subdomain also lets the dashboard use its current same-origin `/api/...` requests and session cookie.
+
+Create a `firebase.json` in the deployment checkout with the following Hosting configuration. Firebase Hosting serves files that exist in `dist/public`; rewrites handle `/admin` and dynamic requests:
+
+```json
+{
+   "hosting": {
+      "public": "dist/public",
+      "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+      "rewrites": [
+         { "source": "/api/**", "run": { "serviceId": "purl-resolver", "region": "REGION" } },
+         { "source": "/admin", "destination": "/index.html" },
+         { "source": "**", "run": { "serviceId": "purl-resolver", "region": "REGION" } }
+      ]
+   }
+}
+```
+
+Build and deploy the static site with the Firebase CLI:
+
+```sh
+npm ci
+npm run build
+firebase deploy --only hosting --project PROJECT_ID
+```
+
+Connect `purl.example.com` to Firebase Hosting using the DNS records shown in its custom-domain setup. Netlify can continue serving the apex domain. DNS record types vary by provider and setup; follow Firebase's instructions rather than assuming every subdomain uses a CNAME. Set `APP_ORIGIN=https://purl.example.com` and the GitHub OAuth callback URL to `https://purl.example.com/api/admin/auth/github/callback`.
+
+### Cloud Run backend
+
+#### Provision Cloud Run dependencies
+
+Complete these steps before running the Cloud Run deploy command. Keep Cloud Run, Cloud SQL, Memorystore, and the VPC connector in the same Google Cloud project and region where possible.
+
+1. **Prepare the project and network.** Select a Google Cloud project with billing enabled and initialize the `gcloud` CLI. Create or choose a VPC network. Enable the Cloud Run, Cloud Build, Artifact Registry, Cloud SQL Admin, Memorystore for Redis, Serverless VPC Access, and Secret Manager APIs. The [VPC connector setup guide](https://docs.cloud.google.com/run/docs/configuring/vpc-connectors) walks through the console and CLI steps. Create the connector in the same region as Cloud Run, attach it to the VPC, and reserve an unused `/28` IPv4 range for the connector. The range must not overlap any existing subnet or route. The connector adds recurring cost; [Direct VPC egress](https://docs.cloud.google.com/run/docs/configuring/vpc-direct-vpc) is an alternative that does not require a connector resource.
+
+2. **Create Cloud SQL for PostgreSQL.** Follow Google's [Cloud SQL instance creation guide](https://docs.cloud.google.com/sql/docs/postgres/create-instance). Choose PostgreSQL, the same region, and private IP on the VPC reachable from Cloud Run. Configure Private Services Access if the console asks for it. Create a database named `purls` and a dedicated application user with a strong password. Record the instance connection name shown on its Overview page; it has the form `PROJECT_ID:REGION:INSTANCE_ID`. The [Cloud Run connection guide](https://docs.cloud.google.com/sql/docs/postgres/connect-run) explains the Cloud SQL attachment and IAM requirements. The Cloud Run service account needs the `Cloud SQL Client` role (`roles/cloudsql.client`).
+
+   Store this connection string as the `DATABASE_URL` secret, replacing the placeholders and URL-encoding special characters in the password:
+
+   ```text
+   postgresql://APP_USER:URL_ENCODED_PASSWORD@/purls?host=/cloudsql/PROJECT_ID:REGION:INSTANCE_ID
+   ```
+
+   The deploy command's `--add-cloudsql-instances PROJECT_ID:REGION:INSTANCE_ID` attaches the instance and makes that Unix socket available to the app.
+
+3. **Create Memorystore for Redis.** Follow the [Memorystore for Redis creation guide](https://docs.cloud.google.com/memorystore/docs/redis/create-manage-instances). Select Redis 7, the same region, and the same VPC as the connector. Choose Basic tier for a non-HA development setup or Standard tier when you need high availability. After creation, find the instance's private IP address and port in its details. With AUTH and in-transit encryption disabled, the app setting is `REDIS_URL=redis://REDIS_PRIVATE_IP:6379`. If you enable Redis AUTH or TLS, configure the corresponding credentials and `rediss://` URL; do not expose the Redis endpoint publicly.
+
+4. **Create secrets.** In [Secret Manager](https://docs.cloud.google.com/secret-manager/docs/creating-and-accessing-secrets), create secrets named `DATABASE_URL`, `GITHUB_CLIENT_SECRET`, and `SESSION_SECRET`, then add a version containing each value. Use the OAuth client secret from GitHub and generate a session secret with `openssl rand -hex 32`. Grant the Cloud Run runtime service account `Secret Manager Secret Accessor` (`roles/secretmanager.secretAccessor`) on these secrets. `GITHUB_CLIENT_ID`, `GITHUB_USERNAME`, `APP_ORIGIN`, `TRUST_PROXY`, and `REDIS_URL` are non-secret service environment variables.
+
+5. **Create or select the Cloud Run service account.** Grant it `roles/cloudsql.client` and access to the three secrets above. Set the service's VPC connector to the connector created in step 1 and use private-ranges-only egress for the Redis private IP and other private endpoints.
+
+The backend must accept public requests from Firebase Hosting rewrites for PURL redirects; admin routes remain protected by the GitHub allowlist and session. Apply the Drizzle schema once as a controlled release step before routing traffic to the new revision.
+
+Cloud Run is a low-operations backend option, but it is serverless: instances can start cold, scale down, or be replaced during deploys. Minimum instances reduce cold starts but do not guarantee an instance will never be terminated. Keep the database and cache connections close to the service and measure redirect latency. **This app does not yet gracefully drain HTTP requests or close its connections on `SIGTERM`; add shutdown handling and use a database pool before relying on Cloud Run for production traffic.**
+
+Deploy the backend from source without installing Docker locally:
+
+```sh
+gcloud run deploy purl-resolver \
+   --source . \
+   --region REGION \
+   --allow-unauthenticated \
+   --command npm \
+   --args start \
+   --vpc-connector VPC_CONNECTOR \
+   --vpc-egress private-ranges-only \
+   --add-cloudsql-instances PROJECT_ID:REGION:INSTANCE \
+   --set-env-vars GITHUB_CLIENT_ID=CLIENT_ID,GITHUB_USERNAME=ADMIN_USERNAME,APP_ORIGIN=https://purl.example.com,TRUST_PROXY=true,REDIS_URL=redis://REDIS_PRIVATE_IP:6379 \
+   --set-secrets DATABASE_URL=DATABASE_URL:latest,GITHUB_CLIENT_SECRET=GITHUB_CLIENT_SECRET:latest,SESSION_SECRET=SESSION_SECRET:latest
+```
+
+Replace the uppercase placeholders and provision the VPC connector, Cloud SQL instance, Memorystore instance, and secrets first. For a Cloud SQL Unix socket connection, the `DATABASE_URL` secret can use this form:
+
+```text
+postgresql://DB_USER:URL_ENCODED_PASSWORD@/DB_NAME?host=/cloudsql/PROJECT_ID:REGION:INSTANCE
+```
+
+`--source .` avoids a local Docker workflow, but Cloud Run still runs a container. Because this repository has a `Dockerfile`, Cloud Build uses it to build the image. The command override above bypasses the Dockerfile's Compose-oriented schema push on startup. Apply schema changes once in a controlled release step before directing traffic to the new revision, rather than running migrations independently from autoscaled instances.
+
+If predictable instance lifetime or latency matters more than minimizing operations, run the backend on Compute Engine behind a managed instance group and HTTPS load balancer. This avoids Cloud Run scale-to-zero behavior but makes you responsible for VM patching, process supervision, capacity, and availability. GKE is appropriate when your organization already operates Kubernetes or needs its scheduling and policy controls; it still runs containers and does not eliminate pod replacement or network latency. For a single resolver, use GKE only when Kubernetes itself is a requirement.
+
+## Troubleshooting
+
+- **The app exits before starting:** Check that all required values are set in `.env`, especially `DATABASE_URL`, `REDIS_URL`, the three GitHub values, and `SESSION_SECRET`.
+- **GitHub reports a callback mismatch:** The callback URL in the OAuth app must exactly match `${APP_ORIGIN}/api/admin/auth/github/callback`, including scheme, host, port, and path.
+- **The dashboard sends you back to sign-in:** Confirm that `GITHUB_USERNAME` matches the GitHub login that completed OAuth.
+- **Database connection fails:** Confirm `DATABASE_URL` uses the credentials and database configured for PostgreSQL. Inside Compose, the database hostname is `db`.

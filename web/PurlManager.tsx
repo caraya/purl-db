@@ -35,6 +35,7 @@ export function PurlManager() {
   const [query, setQuery] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [signedOut, setSignedOut] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
 
@@ -115,8 +116,14 @@ export function PurlManager() {
   }
 
   async function handleSignOut() {
-    await fetch('/api/admin/auth/logout', { method: 'POST' });
-    window.location.assign('/api/admin/auth/github');
+    setError('');
+    try {
+      const response = await fetch('/api/admin/auth/logout', { method: 'POST' });
+      if (!response.ok && response.status !== 401) throw new Error(await getErrorMessage(response));
+      setSignedOut(true);
+    } catch (signOutError) {
+      setError(signOutError instanceof Error ? signOutError.message : 'Unable to sign out.');
+    }
   }
 
   function startEditing(purl: PurlMapping) {
@@ -137,6 +144,27 @@ export function PurlManager() {
     !normalizedQuery || `${purl.title} ${purl.path} ${purl.targetUrl}`.toLowerCase().includes(normalizedQuery),
   );
   const activeCount = purls.filter((purl) => purl.isActive).length;
+
+  if (signedOut) {
+    return (
+      <>
+        <header className="topbar">
+          <a className="brand" href="/admin" aria-label="PURL Registry home">
+            <span className="brand-mark" aria-hidden="true">P</span>
+            <span>PURL <strong>Registry</strong></span>
+          </a>
+        </header>
+        <main className="page-shell">
+          <section className="empty-state" aria-labelledby="signed-out-title">
+            <span className="empty-mark" aria-hidden="true">/</span>
+            <h1 id="signed-out-title">You are signed out</h1>
+            <p>Your PURL management session has ended.</p>
+            <a className="button button-primary" href="/api/admin/auth/github">Sign in with GitHub</a>
+          </section>
+        </main>
+      </>
+    );
+  }
 
   return (
     <>

@@ -9,10 +9,10 @@ services:
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:?Set GITHUB_CLIENT_SECRET in .env}
       GITHUB_USERNAME: ${GITHUB_USERNAME:?Set GITHUB_USERNAME in .env}
       SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in .env}
-      APP_ORIGIN: ${APP_ORIGIN:-http://localhost:3000}
+      APP_ORIGIN: ${APP_ORIGIN:-http://localhost:6677}
       TRUST_PROXY: ${TRUST_PROXY:-false}
     ports:
-      - "${PORT:-3000}:${PORT:-3000}"
+      - "${HOST_PORT:-6677}:${PORT:-3000}"
     depends_on:
       db:
         condition: service_healthy
