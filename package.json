@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc && tsc -p tsconfig.web.json && vite build",
-    "start": "node dist/server.js",
+    "start": "node -e \"console.error('npm start is not needed for the local Docker workflow. Run docker-compose up -d --build, then open http://localhost:6677/admin (or your configured HOST_PORT).'); process.exitCode = 1;\"",
     "test": "npm run typecheck:test && node --experimental-strip-types --test",
     "typecheck:test": "tsc -p test/tsconfig.json",
     "db:push": "drizzle-kit push"

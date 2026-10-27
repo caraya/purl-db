@@ -86,14 +86,15 @@ npm run build
 
 `npm test` type-checks the test files and runs the resolver, admin API, and OAuth behavior tests. `npm run build` compiles the server and creates the production dashboard bundle.
 
-To run outside Docker, provide reachable PostgreSQL and Redis instances and set the same required variables from `.env` in your shell. Use host-reachable service URLs (for example, `localhost` rather than Compose service names), then run:
+Run the local application through Docker Compose:
 
 ```sh
-npm run db:push
-npm start
+docker-compose up -d --build
 ```
 
-The server listens on `PORT` (default `3000`).
+Compose starts the server automatically. Do not run `npm start` afterward: that command prints guidance and exits unsuccessfully rather than launching a second server on your host. PostgreSQL and Redis are available only on the Compose network as `db:5432` and `cache:6379`; neither service publishes a host port. Keep those internal hostnames in `.env`. Only the app's HTTP port is published to the host.
+
+For a non-Compose deployment, launch the compiled server with `node dist/server.js` after applying the schema. Supply the required environment variables through the deployment platform and use database/cache addresses reachable from that environment. The server listens on `PORT` (default `3000`).
 
 ## Google Cloud deployment
 
